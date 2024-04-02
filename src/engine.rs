@@ -208,6 +208,52 @@ impl Engine {
         &self.modules
     }
 
+    /// Evaluate rule(s) at given path.
+    ///
+    /// [`eval_rule`] is often faster than [`eval_query`] and should be preferred if
+    /// OPA style [`QueryResults`] are not needed.
+    ///
+    /// ```
+    /// # use regorus::*;
+    /// # fn main() -> anyhow::Result<()> {
+    /// let mut engine = Engine::new();
+    ///
+    /// // Add policy
+    /// engine.add_policy(
+    ///   "policy.rego".to_string(),
+    ///   r#"
+    ///   package example
+    ///   import rego.v1
+    ///
+    ///   x = [1, 2]
+    ///
+    ///   y := 5 if input.a > 2
+    ///   "#.to_string())?;
+    ///
+    /// // Evaluate rule.
+    /// let v = engine.eval_rule("data.example.x".to_string())?;
+    /// assert_eq!(v, Value::from(vec![Value::from(1), Value::from(2)]));
+    ///
+    /// // y evaluates to undefined.
+    /// let v = engine.eval_rule("data.example.y".to_string())?;
+    /// assert_eq!(v, Value::Undefined);
+    ///
+    /// // Evaluating a non-existent rule is an error.
+    /// let r = engine.eval_rule("data.exaample.x".to_string());
+    /// assert!(r.is_err());
+    ///
+    /// // Path must be valid rule paths.
+    /// assert!( engine.eval_rule("data".to_string()).is_err());
+    /// assert!( engine.eval_rule("data.example".to_string()).is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn eval_rule(&mut self, path: String) -> Result<Value> {
+        self.prepare_for_eval(false)?;
+        self.interpreter.clean_internal_evaluation_state();
+        self.interpreter.eval_rule_in_path(path)
+    }
+
     /// Evaluate a Rego query.
     ///
     /// ```
@@ -241,9 +287,12 @@ impl Engine {
     /// assert_eq!(results.result[0].expressions[0].value, Value::from(true));
     /// # Ok(())
     /// # }
+    /// ```
     pub fn eval_query(&mut self, query: String, enable_tracing: bool) -> Result<QueryResults> {
-        self.eval_modules(enable_tracing)?;
+        self.prepare_for_eval(enable_tracing)?;
+        self.interpreter.clean_internal_evaluation_state();
 
+        self.interpreter.create_rule_prefixes()?;
         let query_module = {
             let source = Source::new(
                 "<query_module.rego>".to_owned(),
@@ -256,6 +305,9 @@ impl Engine {
         let query_source = Source::new("<query.rego>".to_string(), query);
         let mut parser = Parser::new(&query_source)?;
         let query_node = parser.parse_user_query()?;
+        if query_node.span.text() == "data" {
+            self.eval_modules(enable_tracing)?;
+        }
         let query_schedule = Analyzer::new().analyze_query_snippet(&self.modules, &query_node)?;
         self.interpreter.eval_user_query(
             &query_module,
@@ -290,6 +342,7 @@ impl Engine {
     /// assert!(engine.eval_bool_query("true; false; true".to_string(), enable_tracing).is_err());
     /// # Ok(())
     /// # }
+    /// ```
     pub fn eval_bool_query(&mut self, query: String, enable_tracing: bool) -> Result<bool> {
         let results = self.eval_query(query, enable_tracing)?;
         match results.result.len() {
@@ -347,6 +400,38 @@ impl Engine {
     }
 
     #[doc(hidden)]
+    /// Evaluate the given query and all the rules in the supplied policies.
+    ///
+    /// This is mainly used for testing Regorus itself.
+    pub fn eval_query_and_all_rules(
+        &mut self,
+        query: String,
+        enable_tracing: bool,
+    ) -> Result<QueryResults> {
+        self.eval_modules(enable_tracing)?;
+
+        let query_module = {
+            let source = Source::new(
+                "<query_module.rego>".to_owned(),
+                "package __internal_query_module".to_owned(),
+            );
+            Ref::new(Parser::new(&source)?.parse()?)
+        };
+
+        // Parse the query.
+        let query_source = Source::new("<query.rego>".to_string(), query);
+        let mut parser = Parser::new(&query_source)?;
+        let query_node = parser.parse_user_query()?;
+        let query_schedule = Analyzer::new().analyze_query_snippet(&self.modules, &query_node)?;
+        self.interpreter.eval_user_query(
+            &query_module,
+            &query_node,
+            &query_schedule,
+            enable_tracing,
+        )
+    }
+
+    #[doc(hidden)]
     fn prepare_for_eval(&mut self, enable_tracing: bool) -> Result<()> {
         self.interpreter.set_traces(enable_tracing);
 
@@ -380,7 +465,7 @@ impl Engine {
     }
 
     #[doc(hidden)]
-    pub fn eval_rule(
+    pub fn eval_rule_in_module(
         &mut self,
         module: &Ref<Module>,
         rule: &Ref<Rule>,
@@ -513,8 +598,8 @@ impl Engine {
     ///    "#.to_string()
     /// )?;
     ///
-    /// // Evaluation fails since y is not defined.
-    /// assert!(engine.eval_query("data.invalid.y".to_string(), false).is_err());
+    /// // Evaluation fails since rule x calls an extension with out parameter.
+    /// assert!(engine.eval_query("data.invalid.x".to_string(), false).is_err());
     /// # Ok(())
     /// # }
     /// ```
@@ -586,5 +671,44 @@ impl Engine {
     /// Clear the gathered policy coverage data.
     pub fn clear_coverage_data(&mut self) {
         self.interpreter.clear_coverage_data()
+    }
+
+    /// Gather output from print statements instead of emiting to stderr.
+    ///
+    /// See [`Engine::take_prints`].    
+    pub fn set_gather_prints(&mut self, b: bool) {
+        self.interpreter.set_gather_prints(b);
+    }
+
+    /// Take the gathered output of print statements.
+    ///
+    /// ```rust
+    /// # use regorus::*;
+    /// # use anyhow::{bail, Result};
+    /// # fn main() -> Result<()> {
+    /// let mut engine = Engine::new();
+    ///
+    /// // Print to stderr.
+    /// engine.eval_query("print(\"Hello\")".to_string(), false)?;
+    ///
+    /// // Configure gathering print statements.
+    /// engine.set_gather_prints(true);
+    ///
+    /// // Execute query.
+    /// engine.eval_query("print(\"Hello\")".to_string(), false)?;
+    ///
+    /// // Take and clear prints.
+    /// let prints = engine.take_prints()?;
+    /// assert_eq!(prints.len(), 1);
+    /// assert!(prints[0].contains("Hello"));
+    ///
+    /// for p in prints {
+    ///   println!("{p}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn take_prints(&mut self) -> Result<Vec<String>> {
+        self.interpreter.take_prints()
     }
 }

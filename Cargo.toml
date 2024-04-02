@@ -5,12 +5,13 @@ members = [
     "bindings/python",
     "bindings/wasm",
     "bindings/java",
+    "bindings/ruby/ext/regorusrb",
 ]
 
 [package]
 name = "regorus"
 description = "A fast, lightweight Rego (OPA policy language) interpreter"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license-file = "LICENSE"
 repository = "https://github.com/microsoft/regorus"
@@ -72,8 +73,6 @@ anyhow = {version = "1.0.66", features = ["backtrace"] }
 serde = {version = "1.0.150", features = ["derive", "rc"] }
 serde_json = {version = "1.0.89", features = ["arbitrary_precision"] }
 serde_yaml = {version = "0.9.16", optional = true }
-log = "0.4.17"
-env_logger="0.11.1"
 lazy_static = "1.4.0"
 rand = "0.8.5"
 num = "0.4.1"

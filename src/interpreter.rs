@@ -13,9 +13,8 @@ use crate::Rc;
 use crate::{Expression, Extension, Location, QueryResult, QueryResults};
 
 use anyhow::{anyhow, bail, Result};
-use log::info;
 use std::collections::btree_map::Entry as BTreeMapEntry;
-use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound::*;
 use std::str::FromStr;
 
@@ -73,6 +72,10 @@ pub struct Interpreter {
     coverage: HashMap<Source, Vec<bool>>,
     #[cfg(feature = "coverage")]
     enable_coverage: bool,
+
+    gather_prints: bool,
+    prints: Vec<String>,
+    rule_paths: HashSet<String>,
 }
 
 impl Default for Interpreter {
@@ -190,6 +193,10 @@ impl Interpreter {
             coverage: HashMap::new(),
             #[cfg(feature = "coverage")]
             enable_coverage: false,
+
+            gather_prints: false,
+            prints: Vec::default(),
+            rule_paths: HashSet::new(),
         }
     }
 
@@ -230,7 +237,6 @@ impl Interpreter {
 
     pub fn set_input(&mut self, input: Value) {
         self.input = input;
-        info!("input: {:#?}", self.input);
     }
 
     pub fn init_with_document(&mut self) -> Result<()> {
@@ -724,11 +730,6 @@ impl Interpreter {
 
         // TODO: optimize this
         self.variables_assignment(&name, &value)?;
-
-        info!(
-            "eval_assign_expr before, op: {:?}, lhs: {:?}, rhs: {:?}",
-            op, lhs, rhs
-        );
 
         Ok(Value::Bool(true))
     }
@@ -1317,13 +1318,6 @@ impl Interpreter {
     }
 
     fn eval_stmt(&mut self, stmt: &LiteralStmt, stmts: &[&LiteralStmt]) -> Result<bool> {
-        debug_new_group!(
-            "eval_stmt {}:{} {}",
-            stmt.span.line,
-            stmt.span.col,
-            stmt.span.text()
-        );
-
         let (saved_state, skip_exec) = self.apply_with_modifiers(stmt)?;
         let r = if !skip_exec {
             self.eval_stmt_impl(stmt, stmts)
@@ -1905,7 +1899,13 @@ impl Interpreter {
             // ( scalar | ref | var ) ":" term, the OPA
             // implementation is more like expr ":" expr
             let key = self.eval_expr(key)?;
+            if key == Value::Undefined {
+                return Ok(Value::Undefined);
+            }
             let value = self.eval_expr(value)?;
+            if value == Value::Undefined {
+                return Ok(Value::Undefined);
+            }
             object.insert(key, value);
         }
 
@@ -2046,13 +2046,25 @@ impl Interpreter {
         params: &[ExprRef],
     ) -> Result<Value> {
         let mut args = vec![];
-        let allow_undefined = name == "print"; // TODO: with modifier
+        let is_print = name == "print"; // TODO: with modifier
+        let allow_undefined = is_print;
         for p in params {
             match self.eval_expr(p)? {
                 // If any argument is undefined, then the call is undefined.
                 Value::Undefined if !allow_undefined => return Ok(Value::Undefined),
                 p => args.push(p),
             }
+        }
+
+        if is_print && self.gather_prints {
+            // Do not print to stderr. Instead, gather.
+            let msg =
+                builtins::print_to_string(span, params, &args[..], self.strict_builtin_errors)?;
+
+            // Prefix location information.
+            self.prints
+                .push(format!("{}:{}: {msg}", span.source.file(), span.line));
+            return Ok(Value::Bool(true));
         }
 
         let cache = builtins::must_cache(name);
@@ -2431,14 +2443,11 @@ impl Interpreter {
                     || &module_path[path.len()..path.len() + 1] == ".")
             {
                 // Ensure that the module is created.
-                {
-                    let path = Parser::get_path_ref_components(&module.package.refr)?;
-                    let path: Vec<&str> = path.iter().map(|s| s.text()).collect();
-                    let vref = Self::make_or_get_value_mut(&mut self.data, &path[..])?;
-                    if *vref == Value::Undefined {
-                        *vref = Value::new_object();
-                    }
-                    self.mark_processed(&path)?;
+                let path = Parser::get_path_ref_components(&module.package.refr)?;
+                let path: Vec<&str> = path.iter().map(|s| s.text()).collect();
+                let vref = Self::make_or_get_value_mut(&mut self.data, &path[..])?;
+                if *vref == Value::Undefined {
+                    *vref = Value::new_object();
                 }
 
                 for rule in &module.policy {
@@ -2454,6 +2463,7 @@ impl Interpreter {
                     }
                 }
                 self.set_current_module(prev_module)?;
+                self.mark_processed(&path)?;
             }
         }
 
@@ -2461,7 +2471,9 @@ impl Interpreter {
     }
 
     fn ensure_rule_evaluated(&mut self, path: String) -> Result<()> {
+        let mut matched = false;
         if let Some(rules) = self.rules.get(&path) {
+            matched = true;
             for r in rules.clone() {
                 if !self.processed.contains(&r) {
                     let module = self.get_rule_module(&r)?;
@@ -2472,6 +2484,7 @@ impl Interpreter {
 
         // Evaluate the associated default rules after non-default rules
         if let Some(rules) = self.default_rules.get(&path) {
+            matched = true;
             for (r, _) in rules.clone() {
                 if !self.processed.contains(&r) {
                     let module = self.get_rule_module(&r)?;
@@ -2482,8 +2495,11 @@ impl Interpreter {
             }
         }
 
-        let comps: Vec<&str> = path.split('.').collect();
-        self.mark_processed(&comps[1..])
+        if matched {
+            let comps: Vec<&str> = path.split('.').collect();
+            self.mark_processed(&comps[1..])?;
+        }
+        Ok(())
     }
 
     fn is_processed(&self, path: &[&str]) -> Result<bool> {
@@ -2515,7 +2531,6 @@ impl Interpreter {
 
     fn lookup_var(&mut self, span: &Span, fields: &[&str], no_error: bool) -> Result<Value> {
         let name = span.source_str();
-        debug_new_group!("lookup_var: name={name}, fields={fields:?}, no_error={no_error}");
 
         // Return local variable/argument.
         if let Some(v) = self.lookup_local_var(&name) {
@@ -2539,6 +2554,15 @@ impl Interpreter {
         if name.text() == "data" {
             if self.is_processed(fields)? {
                 return Ok(Self::get_value_chained(self.data.clone(), fields));
+            }
+
+            // If "data" is used in a query, without any fields, then evaluate all the modules.
+            if fields.is_empty() && self.active_rules.is_empty() {
+                for module in self.modules.clone() {
+                    for rule in &module.policy {
+                        self.eval_rule(&module, rule)?;
+                    }
+                }
             }
 
             // With modifiers may be used to specify part of a module that that not yet been
@@ -2611,13 +2635,6 @@ impl Interpreter {
     }
 
     fn eval_expr(&mut self, expr: &ExprRef) -> Result<Value> {
-        debug_new_group!(
-            "eval_expr: {}:{} {}",
-            expr.span().line,
-            expr.span().col,
-            expr.span().text()
-        );
-
         #[cfg(feature = "coverage")]
         if self.enable_coverage {
             let span = expr.span();
@@ -2693,7 +2710,22 @@ impl Interpreter {
                 key, value, query, ..
             } => self.eval_object_compr(key, value, query),
             Expr::SetCompr { term, query, .. } => self.eval_set_compr(term, query),
-            Expr::UnaryExpr { .. } => unimplemented!("unar expr is umplemented"),
+            Expr::UnaryExpr { span, expr: uexpr } => match uexpr.as_ref() {
+                Expr::Number(_) if !uexpr.span().text().starts_with('-') => {
+                    builtins::numbers::arithmetic_operation(
+                        span,
+                        &ArithOp::Sub,
+                        expr,
+                        uexpr,
+                        Value::from(0),
+                        self.eval_expr(uexpr)?,
+                        self.strict_builtin_errors,
+                    )
+                }
+                _ => bail!(expr
+                    .span()
+                    .error("unary - can only be used with numeric literals")),
+            },
             Expr::Call { span, fcn, params } => {
                 self.eval_call(span, expr, fcn, params, None, false)
             }
@@ -2874,25 +2906,23 @@ impl Interpreter {
     pub fn get_path_string(refr: &Expr, document: Option<&str>) -> Result<String> {
         let mut comps = vec![];
         let mut expr = Some(refr);
-        while expr.is_some() {
-            match expr {
-                Some(Expr::RefDot { refr, field, .. }) => {
+        while let Some(e) = expr {
+            match e {
+                Expr::RefDot { refr, field, .. } => {
                     comps.push(field.text());
                     expr = Some(refr);
                 }
-                Some(Expr::RefBrack { refr, index, .. })
-                    if matches!(index.as_ref(), Expr::String(_)) =>
-                {
+                Expr::RefBrack { refr, index, .. } if matches!(index.as_ref(), Expr::String(_)) => {
                     if let Expr::String(s) = index.as_ref() {
                         comps.push(s.text());
                         expr = Some(refr);
                     }
                 }
-                Some(Expr::Var(v)) => {
+                Expr::Var(v) => {
                     comps.push(v.text());
                     expr = None;
                 }
-                _ => bail!(format!("internal error: not a simplee ref {expr:?}")),
+                _ => bail!(e.span().error("invalid ref expression")),
             }
         }
         if let Some(d) = document {
@@ -3352,39 +3382,33 @@ impl Interpreter {
     }
 
     pub fn create_rule_prefixes(&mut self) -> Result<()> {
-        debug_new_group!("create_rule_prefixes");
-        debug!("data before: {}", self.data);
-
         for module in self.modules.clone() {
             let module_path = Self::get_rule_path_components(&module.package.refr)?;
-            debug!("processing module {module_path:?}");
 
             for rule in &module.policy {
-                let mut rule_refr = Self::get_rule_refr(rule);
-                debug!("rule refr: {}", rule_refr.span().text());
-                debug!("rule : {:?}", rule);
-                if let Rule::Spec {
-                    head:
-                        RuleHead::Set {
-                            refr, key: None, ..
-                        },
-                    ..
-                } = rule.as_ref()
-                {
-                    rule_refr = match refr.as_ref() {
-                        Expr::RefDot { refr, .. } => refr,
-
-                        _ => refr,
+                let rule_refr = Self::get_rule_refr(rule);
+                let mut prefix_path = module_path.clone();
+                let mut components = Self::get_rule_path_components(rule_refr)?;
+                let is_old_set = matches!(
+                    rule.as_ref(),
+                    Rule::Spec {
+                        head: RuleHead::Set { key: None, .. },
+                        ..
                     }
+                );
+
+                if components.len() >= 2 && is_old_set {
+                    components.pop();
                 }
 
-                let mut prefix_path = module_path.clone();
-                prefix_path.append(&mut Self::get_rule_path_components(rule_refr)?);
-                let prefix_path: Vec<&str> = prefix_path[0..prefix_path.len() - 1]
-                    .iter()
-                    .map(|s| s.as_ref())
-                    .collect();
+                if components.len() > 1 {
+                    components.pop();
+                } else {
+                    continue;
+                }
 
+                prefix_path.append(&mut components);
+                let prefix_path: Vec<&str> = prefix_path.iter().map(|s| s.as_ref()).collect();
                 if Self::get_value_chained(self.data.clone(), &prefix_path) == Value::Undefined {
                     self.update_data(
                         rule_refr.span(),
@@ -3395,7 +3419,7 @@ impl Interpreter {
                 }
             }
         }
-        debug!("data after: {}", self.data);
+
         Ok(())
     }
 
@@ -3404,6 +3428,9 @@ impl Interpreter {
         let comps: Vec<&str> = comps.iter().map(|s| s.text()).collect();
         for c in 0..comps.len() {
             let path = self.current_module_path.clone() + "." + &comps[0..c + 1].join(".");
+            if c + 1 == comps.len() {
+                self.rule_paths.insert(path.clone());
+            }
 
             match self.rules.entry(path) {
                 Entry::Occupied(o) => {
@@ -3411,6 +3438,46 @@ impl Interpreter {
                 }
                 Entry::Vacant(v) => {
                     v.insert(vec![rule.clone()]);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_default_rule(
+        &mut self,
+        refr: &Ref<Expr>,
+        rule: &Ref<Rule>,
+        index: Option<String>,
+    ) -> Result<()> {
+        let comps = Parser::get_path_ref_components(refr)?;
+        let comps: Vec<&str> = comps.iter().map(|s| s.text()).collect();
+        for (idx, c) in (0..comps.len()).enumerate() {
+            let path = self.current_module_path.clone() + "." + &comps[0..c + 1].join(".");
+            if c + 1 == comps.len() {
+                self.rule_paths.insert(path.clone());
+            }
+
+            match self.default_rules.entry(path) {
+                Entry::Occupied(o) => {
+                    if idx + 1 == comps.len() {
+                        for (_, i) in o.get() {
+                            if index.is_some() && i.is_some() {
+                                let old = i.as_ref().unwrap();
+                                let new = index.as_ref().unwrap();
+                                if old == new {
+                                    bail!(refr.span().error("multiple default rules for the variable with the same index"));
+                                }
+                            } else if index.is_some() || i.is_some() {
+                                bail!(refr.span().error("conflict type with the default rules"));
+                            }
+                        }
+                    }
+                    o.into_mut().push((rule.clone(), index.clone()));
+                }
+                Entry::Vacant(v) => {
+                    v.insert(vec![(rule.clone(), index.clone())]);
                 }
             }
         }
@@ -3434,7 +3501,10 @@ impl Interpreter {
                             // Warn redundant import of input. Ignore it.
                             eprintln!(
                                 "{}",
-                                import.refr.span().error("redundant import of `input`")
+                                import
+                                    .refr
+                                    .span()
+                                    .message("warning", "redundant import of `input`")
                             );
                             continue;
                         }
@@ -3492,29 +3562,7 @@ impl Interpreter {
                         _ => (refr, None),
                     };
 
-                    let path = Self::get_path_string(refr, None)?;
-                    let path = self.current_module_path.clone() + "." + &path;
-                    match self.default_rules.entry(path) {
-                        Entry::Occupied(o) => {
-                            for (_, i) in o.get() {
-                                if index.is_some() && i.is_some() {
-                                    let old = i.as_ref().unwrap();
-                                    let new = index.as_ref().unwrap();
-                                    if old == new {
-                                        bail!(refr.span().error("multiple default rules for the variable with the same index"));
-                                    }
-                                } else if index.is_some() || i.is_some() {
-                                    bail!(refr
-                                        .span()
-                                        .error("conflict type with the default rules"));
-                                }
-                            }
-                            o.into_mut().push((rule.clone(), index));
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert(vec![(rule.clone(), index)]);
-                        }
-                    }
+                    self.record_default_rule(refr, rule, index)?;
                 }
             }
             self.set_current_module(prev_module)?;
@@ -3655,5 +3703,27 @@ impl Interpreter {
     #[cfg(feature = "coverage")]
     pub fn clear_coverage_data(&mut self) {
         self.coverage = HashMap::new();
+    }
+
+    pub fn set_gather_prints(&mut self, b: bool) {
+        if b != self.gather_prints {
+            // Clear existing prints.
+            std::mem::take(&mut self.prints);
+        }
+        self.gather_prints = b;
+    }
+
+    pub fn take_prints(&mut self) -> Result<Vec<String>> {
+        Ok(std::mem::take(&mut self.prints))
+    }
+
+    pub fn eval_rule_in_path(&mut self, path: String) -> Result<Value> {
+        if !self.rule_paths.contains(&path) {
+            bail!("not a valid rule path");
+        }
+        self.ensure_rule_evaluated(path.clone())?;
+        let parts: Vec<&str> = path.split('.').collect();
+
+        Ok(Self::get_value_chained(self.data.clone(), &parts[1..]))
     }
 }
